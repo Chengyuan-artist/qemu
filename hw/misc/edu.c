@@ -26,6 +26,7 @@
 #include "qemu/units.h"
 #include "hw/pci/pci.h"
 #include "hw/hw.h"
+#include "hw/qdev-properties.h"
 #include "hw/pci/msi.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
@@ -53,6 +54,9 @@ struct EduState {
     QemuCond thr_cond;
     bool stopping;
 
+    bool enable_pasid;
+    uint32_t try;
+
     uint32_t addr4;
     uint32_t fact;
 #define EDU_STATUS_COMPUTING    0x01
@@ -66,6 +70,9 @@ struct EduState {
 # define EDU_DMA_FROM_PCI       0
 # define EDU_DMA_TO_PCI         1
 #define EDU_DMA_IRQ             0x4
+#define EDU_DMA_PV              0x8
+#define EDU_DMA_PASID(cmd)      (((cmd) >> 8) & ((1U << 20) - 1))
+
     struct dma_state {
         dma_addr_t src;
         dma_addr_t dst;
@@ -126,36 +133,101 @@ static void edu_check_range(uint64_t addr, uint64_t size1, uint64_t start,
 
 static dma_addr_t edu_clamp_addr(const EduState *edu, dma_addr_t addr)
 {
-    dma_addr_t res = addr & edu->dma_mask;
+    dma_addr_t res = addr; // & edu->dma_mask;
+    return res;
+}
 
-    if (addr != res) {
-        printf("EDU: clamping DMA %#.16"PRIx64" to %#.16"PRIx64"!\n", addr, res);
+static bool __find_iommu_mr_cb(Int128 start, Int128 len, const MemoryRegion *mr,
+    hwaddr offset_in_region, void *opaque)
+{
+    IOMMUMemoryRegion **iommu_mr = opaque;
+    *iommu_mr = memory_region_get_iommu((MemoryRegion *)mr);
+    return *iommu_mr != NULL;
+}
+
+static int pci_dma_perm(PCIDevice *pdev, dma_addr_t iova, MemTxAttrs attrs)
+{
+    IOMMUMemoryRegion *iommu_mr = NULL;
+    IOMMUMemoryRegionClass *imrc;
+    int iommu_idx;
+    FlatView *fv;
+
+    RCU_READ_LOCK_GUARD();
+
+    fv = address_space_to_flatview(pci_get_address_space(pdev));
+
+    /* Find first IOMMUMemoryRegion */
+    flatview_for_each_range(fv, __find_iommu_mr_cb, &iommu_mr);
+
+    if (iommu_mr) {
+        imrc = memory_region_get_iommu_class_nocheck(iommu_mr);
+
+        /* IOMMU Index is mapping to memory attributes (PASID, etc) */
+        iommu_idx = imrc->attrs_to_index ?
+                    imrc->attrs_to_index(iommu_mr, attrs) : 0;
+
+        /* Translate request with IOMMU_NONE is an ATS request */
+        IOMMUTLBEntry iotlb = imrc->translate(iommu_mr, iova, IOMMU_NONE,
+                                              iommu_idx);
+
+        return iotlb.perm;
     }
 
-    return res;
+    return IOMMU_NONE;
 }
 
 static void edu_dma_timer(void *opaque)
 {
     EduState *edu = opaque;
     bool raise_irq = false;
+    MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+    MemTxResult res;
 
     if (!(edu->dma.cmd & EDU_DMA_RUN)) {
         return;
     }
 
+    if (edu->enable_pasid && (edu->dma.cmd & EDU_DMA_PV)) {
+        attrs.unspecified = 0;
+        attrs.pasid = EDU_DMA_PASID(edu->dma.cmd);
+        attrs.requester_id = pci_requester_id(&edu->pdev);
+        attrs.secure = 0;
+    }
+
     if (EDU_DMA_DIR(edu->dma.cmd) == EDU_DMA_FROM_PCI) {
         uint64_t dst = edu->dma.dst;
+        uint64_t src = edu_clamp_addr(edu, edu->dma.src);
         edu_check_range(dst, edu->dma.cnt, DMA_START, DMA_SIZE);
         dst -= DMA_START;
-        pci_dma_read(&edu->pdev, edu_clamp_addr(edu, edu->dma.src),
-                edu->dma_buf + dst, edu->dma.cnt);
+        if (edu->try && !(pci_dma_perm(&edu->pdev, src, attrs) & IOMMU_RO)) {
+            edu->try--;
+            /* TODO: PRGR, wait for MAP notification */
+            timer_mod(&edu->dma_timer,
+                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
+            return;
+        }
+        res = pci_dma_rw(&edu->pdev, src, edu->dma_buf + dst, edu->dma.cnt,
+            DMA_DIRECTION_TO_DEVICE, attrs);
+        if (res != MEMTX_OK) {
+            hw_error("EDU: DMA transfer TO 0x%"PRIx64" failed.\n", dst);
+        }
     } else {
         uint64_t src = edu->dma.src;
+        uint64_t dst = edu_clamp_addr(edu, edu->dma.dst);
         edu_check_range(src, edu->dma.cnt, DMA_START, DMA_SIZE);
         src -= DMA_START;
-        pci_dma_write(&edu->pdev, edu_clamp_addr(edu, edu->dma.dst),
-                edu->dma_buf + src, edu->dma.cnt);
+        if (edu->try && !(pci_dma_perm(&edu->pdev, dst, attrs) & IOMMU_WO)) {
+            edu->try--;
+            /* TODO: PRGR, wait for MAP notification */
+            timer_mod(&edu->dma_timer,
+                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
+            return;
+        }
+        res = pci_dma_rw(&edu->pdev, dst, edu->dma_buf + src, edu->dma.cnt,
+            DMA_DIRECTION_FROM_DEVICE, attrs);
+        if (res != MEMTX_OK) {
+            hw_error("EDU: DMA transfer FROM 0x%"PRIx64" failed.\n", src);
+        }
     }
 
     edu->dma.cmd &= ~EDU_DMA_RUN;
@@ -182,6 +254,7 @@ static void dma_rw(EduState *edu, bool write, dma_addr_t *val, dma_addr_t *dma,
     }
 
     if (timer) {
+        edu->try = 1;
         timer_mod(&edu->dma_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
     }
 }
@@ -255,7 +328,8 @@ static void edu_mmio_write(void *opaque, hwaddr addr, uint64_t val,
         if (qatomic_read(&edu->status) & EDU_STATUS_COMPUTING) {
             break;
         }
-        /* EDU_STATUS_COMPUTING cannot go 0->1 concurrently, because it is only
+        /*
+         * EDU_STATUS_COMPUTING cannot go 0->1 concurrently, because it is only
          * set in this function and it is under the iothread mutex.
          */
         qemu_mutex_lock(&edu->thr_mutex);
@@ -267,8 +341,6 @@ static void edu_mmio_write(void *opaque, hwaddr addr, uint64_t val,
     case 0x20:
         if (val & EDU_STATUS_IRQFACT) {
             qatomic_or(&edu->status, EDU_STATUS_IRQFACT);
-            /* Order check of the COMPUTING flag after setting IRQFACT.  */
-            smp_mb__after_rmw();
         } else {
             qatomic_and(&edu->status, ~EDU_STATUS_IRQFACT);
         }
@@ -351,9 +423,6 @@ static void *edu_fact_thread(void *opaque)
         qemu_mutex_unlock(&edu->thr_mutex);
         qatomic_and(&edu->status, ~EDU_STATUS_COMPUTING);
 
-        /* Clear COMPUTING flag before checking IRQFACT.  */
-        smp_mb__after_rmw();
-
         if (qatomic_read(&edu->status) & EDU_STATUS_IRQFACT) {
             qemu_mutex_lock_iothread();
             edu_raise_irq(edu, FACT_IRQ);
@@ -368,8 +437,39 @@ static void pci_edu_realize(PCIDevice *pdev, Error **errp)
 {
     EduState *edu = EDU(pdev);
     uint8_t *pci_conf = pdev->config;
+    int pos;
 
     pci_config_set_interrupt_pin(pci_conf, 1);
+
+    pcie_endpoint_cap_init(pdev, 0);
+
+    /* PCIe extended capability for PASID */
+    pos = PCI_CONFIG_SPACE_SIZE;
+    if (edu->enable_pasid) {
+        /* PCIe Spec 7.8.9 PASID Extended Capability Structure */
+        pcie_add_capability(pdev, PCI_EXT_CAP_ID_PASID, 1, pos, 8);
+        pci_set_long(pdev->config + pos + 4, 0x00001400);
+        pci_set_long(pdev->wmask + pos + 4,  0xfff0ffff);
+        pos += 8;
+
+        /* ATS Capability */
+        pcie_ats_init(pdev, pos, true);
+        pos += PCI_EXT_CAP_ATS_SIZEOF;
+
+        /* PRI Capability */
+        pcie_add_capability(pdev, PCI_EXT_CAP_ID_PRI, 1, pos, 16);
+        /* PRI STOPPED */
+        pci_set_long(pdev->config + pos +  4, 0x01000000);
+        /* PRI ENABLE bit writable */
+        pci_set_long(pdev->wmask  + pos +  4, 0x00000001);
+        /* PRI Capacity Supported */
+        pci_set_long(pdev->config + pos +  8, 0x00000080);
+        /* PRI Allocations Allowed, 32 */
+        pci_set_long(pdev->config + pos + 12, 0x00000040);
+        pci_set_long(pdev->wmask  + pos + 12, 0x0000007f);
+
+        pos += 8;
+    }
 
     if (msi_init(pdev, 0, 1, true, false, errp)) {
         return;
@@ -404,20 +504,27 @@ static void pci_edu_uninit(PCIDevice *pdev)
     msi_uninit(pdev);
 }
 
+
 static void edu_instance_init(Object *obj)
 {
     EduState *edu = EDU(obj);
 
-    edu->dma_mask = (1UL << 28) - 1;
+    edu->dma_mask = ~0ULL; // (1ULL << 56) - 1;
     object_property_add_uint64_ptr(obj, "dma_mask",
                                    &edu->dma_mask, OBJ_PROP_FLAG_READWRITE);
 }
+
+static Property edu_properties[] = {
+    DEFINE_PROP_BOOL("pasid", EduState, enable_pasid, TRUE),
+    DEFINE_PROP_END_OF_LIST(),
+};
 
 static void edu_class_init(ObjectClass *class, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(class);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(class);
 
+    device_class_set_props(dc, edu_properties);
     k->realize = pci_edu_realize;
     k->exit = pci_edu_uninit;
     k->vendor_id = PCI_VENDOR_ID_QEMU;
@@ -430,7 +537,7 @@ static void edu_class_init(ObjectClass *class, void *data)
 static void pci_edu_register_types(void)
 {
     static InterfaceInfo interfaces[] = {
-        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+        { INTERFACE_PCIE_DEVICE },
         { },
     };
     static const TypeInfo edu_info = {
