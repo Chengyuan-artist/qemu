@@ -3005,6 +3005,7 @@ if have_system
     'hw/rdma',
     'hw/rdma/vmw',
     'hw/rtc',
+    'hw/riscv',
     'hw/s390x',
     'hw/scsi',
     'hw/sd',
