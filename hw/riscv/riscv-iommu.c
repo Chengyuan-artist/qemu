@@ -513,9 +513,11 @@ static bool riscv_iommu_msi_check(RISCVIOMMUState *s, RISCVIOMMUContext *ctx,
     }
 
     if ((PPN_DOWN(iova) ^ ctx->msi_addr_pattern) & ~ctx->msi_addr_mask) {
+        trace_riscv_iommu_msi_check(s->parent_obj.id, iova, false);
         return false; /* IOVA not in MSI range defined by AIA IMSIC rules. */
     }
 
+    trace_riscv_iommu_msi_check(s->parent_obj.id, iova, true);
     return true;
 }
 
@@ -562,6 +564,10 @@ static MemTxResult riscv_iommu_msi_write(RISCVIOMMUState *s,
         /* MSI Pass-through mode */
         addr = PPN_PHYS(get_field(pte[0], RIO_MSIPTE_PPN));
         addr = addr | (iova & TARGET_PAGE_MASK);
+
+        trace_riscv_iommu_msi_write(s->parent_obj.id, PCI_BUS_NUM(ctx->devid), PCI_SLOT(ctx->devid),
+        PCI_FUNC(ctx->devid), iova, addr);
+
         return dma_memory_write(s->target_as, addr, &data, size, attrs);
     case RIO_MSIPTE_M_MRIF:
         /* MRIF mode, continue. */

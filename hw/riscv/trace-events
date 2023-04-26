@@ -10,3 +10,5 @@ riscv_iommu_cmd(const char *id, uint64_t l, uint64_t u) "%s: command 0x%"PRIx64"
 riscv_iommu_notifier_add(const char *id) "%s: dev-iotlb notifier added"
 riscv_iommu_notifier_del(const char *id) "%s: dev-iotlb notifier removed"
 riscv_iommu_ats_inval(const char *id) "%s: dev-iotlb invalidate"
+riscv_iommu_msi_write(const char *id, unsigned b, unsigned d, unsigned f, uint64_t iova, uint64_t phys) "%s: translate %04x:%02x.%u 0x%"PRIx64" -> 0x%"PRIx64
+riscv_iommu_msi_check(const char *id, uint64_t iova, bool msi) "%s:msi_check 0x%"PRIx64": is_msi? %d"
